@@ -76,9 +76,9 @@ async def handle_bot_turns(game_id: str):
                 return
                 
             if db_game.game_type == "go":
-                from gameLogic.go.bot import get_bot_move
-                from gameLogic.go.logic import make_move as go_make_move, calculate_score
-                from gameLogic.go.rules import get_next_turn_go
+                from go.bot import get_bot_move
+                from go.logic import make_move as go_make_move, calculate_score
+                from go.rules import get_next_turn_go
                 
                 row, col, pass_turn = get_bot_move(db_game.board_state, current_player.color)
                 
@@ -130,8 +130,8 @@ async def handle_bot_turns(game_id: str):
                         })
                         
             elif db_game.game_type == "snake-ladder":
-                from gameLogic.snake_ladder.logic import make_move as sl_make_move, check_winner as sl_check_winner
-                from gameLogic.snake_ladder.rules import get_next_turn
+                from snake_ladder.logic import make_move as sl_make_move, check_winner as sl_check_winner
+                from snake_ladder.rules import get_next_turn
                 
                 roll = random.randint(1, 6)
                 new_board_state, move_desc = sl_make_move(db_game.board_state, current_player.color, roll)
@@ -167,9 +167,9 @@ async def handle_bot_turns(game_id: str):
                 })
                 
             elif db_game.game_type == "ludo":
-                from gameLogic.ludo.bot import get_bot_move
-                from gameLogic.ludo.logic import make_move as ludo_make_move, check_winner as ludo_check_winner
-                from gameLogic.ludo.rules import get_next_turn
+                from ludo.bot import get_bot_move
+                from ludo.logic import make_move as ludo_make_move, check_winner as ludo_check_winner
+                from ludo.rules import get_next_turn
                 
                 roll = random.randint(1, 6)
                 db_game.last_roll = roll
@@ -372,19 +372,19 @@ async def start_game(game_id: str, session: Session = Depends(get_session)):
         
     active_colors = [p.color for p in game.players]
     if game.game_type == "snake-ladder":
-        from gameLogic.snake_ladder.logic import initialize_board
+        from snake_ladder.logic import initialize_board
         game.board_state = initialize_board(active_colors)
         if "RED" in active_colors:
             game.current_turn = "RED"
         else:
             game.current_turn = active_colors[0]
     elif game.game_type == "go":
-        from gameLogic.go.logic import initialize_board
+        from go.logic import initialize_board
         size = game.board_state.get("size", 9)
         game.board_state = initialize_board(size)
         game.current_turn = "BLACK"  # Black always plays first
     else:
-        from gameLogic.ludo.logic import initialize_board
+        from ludo.logic import initialize_board
         game.board_state = initialize_board(active_colors)
         if "RED" in active_colors:
             game.current_turn = "RED"
@@ -469,8 +469,8 @@ async def websocket_endpoint(websocket: WebSocket, game_id: str, username: str):
                     if db_game.game_type == "snake-ladder":
                         # Snakes & Ladders automatic move logic
                         roll = random.randint(1, 6)
-                        from gameLogic.snake_ladder import make_move as sl_make_move, check_winner as sl_check_winner
-                        from gameLogic.ludo import get_next_turn
+                        from snake_ladder import make_move as sl_make_move, check_winner as sl_check_winner
+                        from ludo import get_next_turn
                         
                         new_board_state, move_desc = sl_make_move(db_game.board_state, db_player.color, roll)
                         db_game.board_state = new_board_state
@@ -518,7 +518,7 @@ async def websocket_endpoint(websocket: WebSocket, game_id: str, username: str):
                         tokens = db_game.board_state[db_player.color]
                         msg = f"{db_player.username} ({db_player.color}) rolled a {roll}."
                         
-                        from gameLogic.ludo.rules import has_valid_moves, get_next_turn
+                        from ludo.rules import has_valid_moves, get_next_turn
                         if not has_valid_moves(db_player.color, tokens, roll):
                             db_game.has_rolled = False
                             active_colors = [p.color for p in db_game.players]
@@ -554,8 +554,8 @@ async def websocket_endpoint(websocket: WebSocket, game_id: str, username: str):
                         await websocket.send_json({"type": "error", "message": "Invalid token index (must be 0 to 3)."})
                         continue
                         
-                    from gameLogic.ludo.logic import make_move, check_winner
-                    from gameLogic.ludo.rules import get_next_turn
+                    from ludo.logic import make_move, check_winner
+                    from ludo.rules import get_next_turn
                     
                     board_copy = {k: list(v) for k, v in db_game.board_state.items()}
                     new_board_state, captured, move_desc = make_move(
@@ -611,8 +611,8 @@ async def websocket_endpoint(websocket: WebSocket, game_id: str, username: str):
                     
                     if pass_turn:
                         db_game.board_state["consecutive_passes"] += 1
-                        from gameLogic.go.rules import get_next_turn_go as go_get_next_turn
-                        from gameLogic.go.logic import calculate_score
+                        from go.rules import get_next_turn_go as go_get_next_turn
+                        from go.logic import calculate_score
                         
                         msg = f"{db_player.username} ({db_player.color}) passed."
                         
@@ -649,8 +649,8 @@ async def websocket_endpoint(websocket: WebSocket, game_id: str, username: str):
                             await websocket.send_json({"type": "error", "message": "Row and Col are required."})
                             continue
                             
-                        from gameLogic.go.logic import make_move as go_make_move
-                        from gameLogic.go.rules import get_next_turn_go as go_get_next_turn
+                        from go.logic import make_move as go_make_move
+                        from go.rules import get_next_turn_go as go_get_next_turn
                         
                         new_board_state, success, move_desc = go_make_move(db_game.board_state, db_player.color, row, col)
                         if not success:

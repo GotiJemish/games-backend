@@ -573,6 +573,10 @@ async def start_game(game_id: str, session: Session = Depends(get_session)):
     session.refresh(game)
     
     import asyncio
+    asyncio.create_task(manager.broadcast(game.id, {
+        "type": "state",
+        "game": serialize_game(game)
+    }))
     asyncio.create_task(handle_bot_turns(game.id))
     
     return serialize_game(game)
@@ -608,7 +612,7 @@ async def websocket_endpoint(websocket: WebSocket, game_id: str, username: str):
     # Send current state
     with Session(engine) as session:
         db_game = session.get(Game, game_id)
-        await websocket.send_json({
+        await manager.broadcast(game_id, {
             "type": "state",
             "game": serialize_game(db_game)
         })

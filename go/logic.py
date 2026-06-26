@@ -74,18 +74,24 @@ def make_move(
         return board_state, False, "Ko rule violation: Cannot recreate immediate previous board state."
 
     # Move is valid
-    board_state["previous_stones"] = old_stones
-    board_state["stones"] = stones
-    board_state["consecutive_passes"] = 0
-    if color not in board_state["captured"]:
-         board_state["captured"][color] = 0
-    board_state["captured"][color] += captured_count
+    new_captured = dict(board_state.get("captured", {}))
+    if color not in new_captured:
+        new_captured[color] = 0
+    new_captured[color] += captured_count
+
+    new_board_state = {
+        "size": size,
+        "stones": stones,
+        "captured": new_captured,
+        "consecutive_passes": 0,
+        "previous_stones": old_stones
+    }
 
     msg = f"{color} placed a stone at ({row}, {col})."
     if captured_count > 0:
         msg += f" Captured {captured_count} opponent stone(s)!"
 
-    return board_state, True, msg
+    return new_board_state, True, msg
 
 def calculate_score(board_state: dict) -> dict:
     """

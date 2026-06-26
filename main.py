@@ -1,6 +1,7 @@
 import random
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import Session, select
 from typing import Dict, List
 
@@ -83,7 +84,7 @@ async def handle_bot_turns(game_id: str):
                 row, col, pass_turn = get_bot_move(db_game.board_state, current_player.color)
                 
                 if pass_turn:
-                    db_game.board_state["consecutive_passes"] += 1
+                    db_game.board_state = {**db_game.board_state, "consecutive_passes": db_game.board_state.get("consecutive_passes", 0) + 1}
                     msg = f"{current_player.username} passed."
                     
                     if db_game.board_state["consecutive_passes"] >= 2:
@@ -230,6 +231,121 @@ async def handle_bot_turns(game_id: str):
                         "message": move_desc,
                         "game": serialize_game(db_game)
                     })
+            elif db_game.game_type == "chess":
+                from chess_game.bot import get_bot_move
+                from chess_game.logic import make_move as chess_make_move
+                from chess_game.rules import get_next_turn_chess, is_game_over as chess_is_game_over
+                
+                difficulty = db_game.board_state.get("difficulty", "medium")
+                fen = db_game.board_state.get("fen")
+                
+                bot_move_uci = get_bot_move(fen, difficulty)
+                if bot_move_uci:
+                    new_board_state, success, move_desc = chess_make_move(db_game.board_state, bot_move_uci)
+                    if success:
+                        db_game.board_state = new_board_state
+                        
+                        is_over, winner = chess_is_game_over(new_board_state["fen"])
+                        if is_over:
+                            db_game.status = "finished"
+                            db_game.winner = winner
+                            db_game.current_turn = None
+                            move_desc += f" Game Over! Winner: {winner}"
+                        else:
+                            db_game.current_turn = get_next_turn_chess(current_player.color)
+                            
+                        db_game.has_rolled = False
+                        db_game.last_roll = None
+                        
+                        db.add(db_game)
+                        db.commit()
+                        db.refresh(db_game)
+                        
+                        await manager.broadcast(game_id, {
+                            "type": "move",
+                            "username": current_player.username,
+                            "color": current_player.color,
+                            "message": move_desc,
+                            "game": serialize_game(db_game)
+                        })
+            elif db_game.game_type == "tic-tac-toe":
+                from tic_tac_toe.bot import get_bot_move
+                from tic_tac_toe.logic import make_move as ttt_make_move
+                from tic_tac_toe.rules import get_next_turn_ttt, check_winner_ttt
+                
+                difficulty = db_game.board_state.get("difficulty", "medium")
+                board = db_game.board_state.get("board")
+                
+                bot_move = get_bot_move(board, current_player.color, difficulty)
+                if bot_move is not None:
+                    new_board_state, success, move_desc = ttt_make_move(db_game.board_state, current_player.color, bot_move)
+                    if success:
+                        db_game.board_state = new_board_state
+                        
+                        winner = check_winner_ttt(new_board_state["board"])
+                        if winner:
+                            db_game.status = "finished"
+                            db_game.winner = winner
+                            db_game.current_turn = None
+                            if winner == "DRAW":
+                                move_desc += " Game Over! It's a DRAW!"
+                            else:
+                                move_desc += f" Game Over! Winner: {winner}"
+                        else:
+                            db_game.current_turn = get_next_turn_ttt(current_player.color)
+                            
+                        db_game.has_rolled = False
+                        db_game.last_roll = None
+                        
+                        db.add(db_game)
+                        db.commit()
+                        db.refresh(db_game)
+                        
+                        await manager.broadcast(game_id, {
+                            "type": "move",
+                            "username": current_player.username,
+                            "color": current_player.color,
+                            "message": move_desc,
+                            "game": serialize_game(db_game)
+                        })
+            elif db_game.game_type == "bingo":
+                from bingo.bot import get_bot_move
+                from bingo.logic import make_move as bingo_make_move
+                from bingo.rules import get_next_turn_bingo, check_winner_bingo
+                
+                difficulty = db_game.board_state.get("difficulty", "medium")
+                bot_move = get_bot_move(db_game.board_state, current_player.color, difficulty)
+                if bot_move is not None:
+                    new_board_state, success, move_desc = bingo_make_move(db_game.board_state, current_player.color, bot_move)
+                    if success:
+                        db_game.board_state = new_board_state
+                        
+                        winner = check_winner_bingo(new_board_state)
+                        if winner:
+                            db_game.status = "finished"
+                            db_game.winner = winner
+                            db_game.current_turn = None
+                            if winner == "DRAW":
+                                move_desc += " Game Over! It's a DRAW!"
+                            else:
+                                move_desc += f" Game Over! Winner: {winner}"
+                        else:
+                            db_game.current_turn = get_next_turn_bingo(current_player.color)
+                            
+                        db_game.has_rolled = False
+                        db_game.last_roll = None
+                        
+                        db.add(db_game)
+                        db.commit()
+                        db.refresh(db_game)
+                        
+                        await manager.broadcast(game_id, {
+                            "type": "move",
+                            "username": current_player.username,
+                            "color": current_player.color,
+                            "message": move_desc,
+                            "game": serialize_game(db_game)
+                        })
             
             # Chain play recursively if next player is also a bot
             asyncio.create_task(handle_bot_turns(game_id))
@@ -242,11 +358,20 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 class CreateGameRequest(BaseModel):
     username: str
     color: str
-    game_type: str = "ludo"  # "ludo", "snake-ladder", "go"
+    game_type: str = "ludo"  # "ludo", "snake-ladder", "go", "chess", "tic-tac-toe", "bingo"
     board_size: int = 9      # For Go: 9, 13, 19
+    difficulty: str = "medium" # For Chess/Tic-Tac-Toe/Bingo: easy, medium, hard
 
 class JoinGameRequest(BaseModel):
     username: str
@@ -254,25 +379,44 @@ class JoinGameRequest(BaseModel):
 
 @app.get('/')
 def read_root():
-    return {"message": "Ludo Backend is running!"}
+    return {"message": "Arcade Backend is running!"}
 
 @app.post("/games/create")
 def create_game(req: CreateGameRequest, session: Session = Depends(get_session)):
     color_upper = req.color.upper()
     game_type_lower = req.game_type.lower()
     
-    if game_type_lower not in ["ludo", "snake-ladder", "go"]:
-        raise HTTPException(status_code=400, detail="Game type must be ludo, snake-ladder, or go")
+    if game_type_lower not in ["ludo", "snake-ladder", "go", "chess", "tic-tac-toe", "bingo"]:
+        raise HTTPException(status_code=400, detail="Game type must be ludo, snake-ladder, go, chess, tic-tac-toe, or bingo")
         
-    if game_type_lower == "go":
+    if game_type_lower in ["go", "chess"]:
         if color_upper not in ["BLACK", "WHITE"]:
-            raise HTTPException(status_code=400, detail="Color for Go must be BLACK or WHITE")
+            raise HTTPException(status_code=400, detail="Color for Go or Chess must be BLACK or WHITE")
+    elif game_type_lower == "tic-tac-toe":
+        if color_upper not in ["X", "O"]:
+            raise HTTPException(status_code=400, detail="Color for Tic-Tac-Toe must be X or O")
+    elif game_type_lower == "bingo":
+        if color_upper not in ["BLUE", "RED"]:
+            raise HTTPException(status_code=400, detail="Color for Bingo must be BLUE or RED")
     else:
         if color_upper not in ["RED", "GREEN", "YELLOW", "BLUE"]:
             raise HTTPException(status_code=400, detail="Color must be RED, GREEN, YELLOW, or BLUE")
         
-    # Store initial board_size inside board_state
-    initial_board_state = {"size": req.board_size} if game_type_lower == "go" else {}
+    # Store initial board_size inside board_state or initialize chess/tic-tac-toe/bingo board
+    if game_type_lower == "go":
+        initial_board_state = {"size": req.board_size}
+    elif game_type_lower == "chess":
+        from chess_game.logic import initialize_board as chess_init
+        initial_board_state = chess_init(req.difficulty)
+    elif game_type_lower == "tic-tac-toe":
+        from tic_tac_toe.logic import initialize_board as ttt_init
+        initial_board_state = ttt_init(req.difficulty)
+    elif game_type_lower == "bingo":
+        from bingo.logic import initialize_board as bingo_init
+        initial_board_state = bingo_init(req.difficulty)
+    else:
+        initial_board_state = {}
+        
     game = Game(game_type=game_type_lower, board_state=initial_board_state)
     session.add(game)
     session.commit()
@@ -293,14 +437,20 @@ def join_game(game_id: str, req: JoinGameRequest, session: Session = Depends(get
     if game.status != "waiting":
         raise HTTPException(status_code=400, detail="Cannot join a game that has already started or finished")
         
-    max_players = 2 if game.game_type == "go" else 4
+    max_players = 2 if game.game_type in ["go", "chess", "tic-tac-toe", "bingo"] else 4
     if len(game.players) >= max_players:
         raise HTTPException(status_code=400, detail=f"Game is full (max {max_players} players)")
         
     color_upper = req.color.upper()
-    if game.game_type == "go":
+    if game.game_type in ["go", "chess"]:
         if color_upper not in ["BLACK", "WHITE"]:
-            raise HTTPException(status_code=400, detail="Color for Go must be BLACK or WHITE")
+            raise HTTPException(status_code=400, detail="Color for Go or Chess must be BLACK or WHITE")
+    elif game.game_type == "tic-tac-toe":
+        if color_upper not in ["X", "O"]:
+            raise HTTPException(status_code=400, detail="Color for Tic-Tac-Toe must be X or O")
+    elif game.game_type == "bingo":
+        if color_upper not in ["BLUE", "RED"]:
+            raise HTTPException(status_code=400, detail="Color for Bingo must be BLUE or RED")
     else:
         if color_upper not in ["RED", "GREEN", "YELLOW", "BLUE"]:
             raise HTTPException(status_code=400, detail="Color must be RED, GREEN, YELLOW, or BLUE")
@@ -326,14 +476,20 @@ async def add_bot(game_id: str, req: JoinGameRequest, session: Session = Depends
     if game.status != "waiting":
         raise HTTPException(status_code=400, detail="Cannot add bot to a game that has already started or finished")
         
-    max_players = 2 if game.game_type == "go" else 4
+    max_players = 2 if game.game_type in ["go", "chess", "tic-tac-toe", "bingo"] else 4
     if len(game.players) >= max_players:
         raise HTTPException(status_code=400, detail=f"Game is full (max {max_players} players)")
         
     color_upper = req.color.upper()
-    if game.game_type == "go":
+    if game.game_type in ["go", "chess"]:
         if color_upper not in ["BLACK", "WHITE"]:
-            raise HTTPException(status_code=400, detail="Color for Go must be BLACK or WHITE")
+            raise HTTPException(status_code=400, detail="Color for Go or Chess must be BLACK or WHITE")
+    elif game.game_type == "tic-tac-toe":
+        if color_upper not in ["X", "O"]:
+            raise HTTPException(status_code=400, detail="Color for Tic-Tac-Toe must be X or O")
+    elif game.game_type == "bingo":
+        if color_upper not in ["BLUE", "RED"]:
+            raise HTTPException(status_code=400, detail="Color for Bingo must be BLUE or RED")
     else:
         if color_upper not in ["RED", "GREEN", "YELLOW", "BLUE"]:
             raise HTTPException(status_code=400, detail="Color must be RED, GREEN, YELLOW, or BLUE")
@@ -383,6 +539,23 @@ async def start_game(game_id: str, session: Session = Depends(get_session)):
         size = game.board_state.get("size", 9)
         game.board_state = initialize_board(size)
         game.current_turn = "BLACK"  # Black always plays first
+    elif game.game_type == "chess":
+        from chess_game.logic import initialize_board as chess_init
+        difficulty = game.board_state.get("difficulty", "medium")
+        game.board_state = chess_init(difficulty=difficulty)
+        game.current_turn = "WHITE"  # White always plays first
+    elif game.game_type == "tic-tac-toe":
+        from tic_tac_toe.logic import initialize_board as ttt_init
+        difficulty = game.board_state.get("difficulty", "medium")
+        game.board_state = ttt_init(difficulty=difficulty)
+        game.current_turn = "X"      # X always plays first
+    elif game.game_type == "bingo":
+        from bingo.logic import setup_game_boards
+        game.board_state = setup_game_boards(game.board_state, active_colors)
+        if "BLUE" in active_colors:
+            game.current_turn = "BLUE"
+        else:
+            game.current_turn = active_colors[0]
     else:
         from ludo.logic import initialize_board
         game.board_state = initialize_board(active_colors)
@@ -610,7 +783,7 @@ async def websocket_endpoint(websocket: WebSocket, game_id: str, username: str):
                     pass_turn = data.get("pass_turn", False)
                     
                     if pass_turn:
-                        db_game.board_state["consecutive_passes"] += 1
+                        db_game.board_state = {**db_game.board_state, "consecutive_passes": db_game.board_state.get("consecutive_passes", 0) + 1}
                         from go.rules import get_next_turn_go as go_get_next_turn
                         from go.logic import calculate_score
                         
@@ -675,7 +848,161 @@ async def websocket_endpoint(websocket: WebSocket, game_id: str, username: str):
                         })
                         import asyncio
                         asyncio.create_task(handle_bot_turns(game_id))
+                elif action == "move_piece":
+                    if db_game.game_type != "chess":
+                        await websocket.send_json({"type": "error", "message": "Action not allowed for this game type."})
+                        continue
+                    if db_game.current_turn != db_player.color:
+                        await websocket.send_json({"type": "error", "message": "It is not your turn."})
+                        continue
                         
+                    from_square = data.get("from_square")
+                    to_square = data.get("to_square")
+                    promotion = data.get("promotion")
+                    
+                    if not from_square or not to_square:
+                        await websocket.send_json({"type": "error", "message": "from_square and to_square are required."})
+                        continue
+                        
+                    move_uci = f"{from_square}{to_square}{promotion or ''}"
+                    
+                    from chess_game.logic import make_move as chess_make_move
+                    from chess_game.rules import get_next_turn_chess, is_game_over as chess_is_game_over
+                    
+                    new_board_state, success, move_desc = chess_make_move(db_game.board_state, move_uci)
+                    if not success:
+                        await websocket.send_json({"type": "error", "message": move_desc})
+                        continue
+                        
+                    db_game.board_state = new_board_state
+                    
+                    is_over, winner = chess_is_game_over(new_board_state["fen"])
+                    if is_over:
+                        db_game.status = "finished"
+                        db_game.winner = winner
+                        db_game.current_turn = None
+                        move_desc += f" Game Over! Winner: {winner}"
+                    else:
+                        db_game.current_turn = get_next_turn_chess(db_player.color)
+                        
+                    db_game.has_rolled = False
+                    db_game.last_roll = None
+                    
+                    db.add(db_game)
+                    db.commit()
+                    db.refresh(db_game)
+                    
+                    await manager.broadcast(game_id, {
+                        "type": "move",
+                        "username": db_player.username,
+                        "color": db_player.color,
+                        "message": move_desc,
+                        "game": serialize_game(db_game)
+                    })
+                    import asyncio
+                    asyncio.create_task(handle_bot_turns(game_id))
+                elif action == "place_mark":
+                    if db_game.game_type != "tic-tac-toe":
+                        await websocket.send_json({"type": "error", "message": "Action not allowed for this game type."})
+                        continue
+                    if db_game.current_turn != db_player.color:
+                        await websocket.send_json({"type": "error", "message": "It is not your turn."})
+                        continue
+                        
+                    position = data.get("position")
+                    if position is None:
+                        await websocket.send_json({"type": "error", "message": "Position is required."})
+                        continue
+                        
+                    from tic_tac_toe.logic import make_move as ttt_make_move
+                    from tic_tac_toe.rules import get_next_turn_ttt, check_winner_ttt
+                    
+                    new_board_state, success, move_desc = ttt_make_move(db_game.board_state, db_player.color, position)
+                    if not success:
+                        await websocket.send_json({"type": "error", "message": move_desc})
+                        continue
+                        
+                    db_game.board_state = new_board_state
+                    
+                    winner = check_winner_ttt(new_board_state["board"])
+                    if winner:
+                        db_game.status = "finished"
+                        db_game.winner = winner
+                        db_game.current_turn = None
+                        if winner == "DRAW":
+                            move_desc += " Game Over! It's a DRAW!"
+                        else:
+                            move_desc += f" Game Over! Winner: {winner}"
+                    else:
+                        db_game.current_turn = get_next_turn_ttt(db_player.color)
+                        
+                    db_game.has_rolled = False
+                    db_game.last_roll = None
+                    
+                    db.add(db_game)
+                    db.commit()
+                    db.refresh(db_game)
+                    
+                    await manager.broadcast(game_id, {
+                        "type": "move",
+                        "username": db_player.username,
+                        "color": db_player.color,
+                        "message": move_desc,
+                        "game": serialize_game(db_game)
+                    })
+                    import asyncio
+                    asyncio.create_task(handle_bot_turns(game_id))
+                elif action == "choose_number":
+                    if db_game.game_type != "bingo":
+                        await websocket.send_json({"type": "error", "message": "Action not allowed for this game type."})
+                        continue
+                    if db_game.current_turn != db_player.color:
+                        await websocket.send_json({"type": "error", "message": "It is not your turn."})
+                        continue
+                        
+                    number = data.get("number")
+                    if number is None:
+                        await websocket.send_json({"type": "error", "message": "Number is required."})
+                        continue
+                        
+                    from bingo.logic import make_move as bingo_make_move
+                    from bingo.rules import get_next_turn_bingo, check_winner_bingo
+                    
+                    new_board_state, success, move_desc = bingo_make_move(db_game.board_state, db_player.color, number)
+                    if not success:
+                        await websocket.send_json({"type": "error", "message": move_desc})
+                        continue
+                        
+                    db_game.board_state = new_board_state
+                    
+                    winner = check_winner_bingo(new_board_state)
+                    if winner:
+                        db_game.status = "finished"
+                        db_game.winner = winner
+                        db_game.current_turn = None
+                        if winner == "DRAW":
+                            move_desc += " Game Over! It's a DRAW!"
+                        else:
+                            move_desc += f" Game Over! Winner: {winner}"
+                    else:
+                        db_game.current_turn = get_next_turn_bingo(db_player.color)
+                        
+                    db_game.has_rolled = False
+                    db_game.last_roll = None
+                    
+                    db.add(db_game)
+                    db.commit()
+                    db.refresh(db_game)
+                    
+                    await manager.broadcast(game_id, {
+                        "type": "move",
+                        "username": db_player.username,
+                        "color": db_player.color,
+                        "message": move_desc,
+                        "game": serialize_game(db_game)
+                    })
+                    import asyncio
+                    asyncio.create_task(handle_bot_turns(game_id))
                 elif action == "chat":
                     msg = data.get("message", "")
                     if msg:

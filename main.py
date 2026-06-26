@@ -7,50 +7,13 @@ from typing import Dict, List
 
 from db_connect import init_db, get_session, engine
 from models import Game, Player
+from go.api import router as go_router
+from chess_game.api import router as chess_router
+from tic_tac_toe.api import router as ttt_router
 from pydantic import BaseModel
 
 # Create a connection manager for WebSockets
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: Dict[str, List[WebSocket]] = {}
-
-    async def connect(self, game_id: str, websocket: WebSocket):
-        await websocket.accept()
-        if game_id not in self.active_connections:
-            self.active_connections[game_id] = []
-        self.active_connections[game_id].append(websocket)
-
-    def disconnect(self, game_id: str, websocket: WebSocket):
-        if game_id in self.active_connections:
-            if websocket in self.active_connections[game_id]:
-                self.active_connections[game_id].remove(websocket)
-            if not self.active_connections[game_id]:
-                del self.active_connections[game_id]
-
-    async def broadcast(self, game_id: str, message: dict):
-        if game_id in self.active_connections:
-            for connection in self.active_connections[game_id]:
-                try:
-                    await connection.send_json(message)
-                except Exception:
-                    pass
-
-manager = ConnectionManager()
-
-def serialize_game(game: Game) -> dict:
-    return {
-        "id": game.id,
-        "game_type": game.game_type,
-        "status": game.status,
-        "current_turn": game.current_turn,
-        "last_roll": game.last_roll,
-        "has_rolled": game.has_rolled,
-        "winner": game.winner,
-        "board_state": game.board_state,
-        "players": [
-            {"username": p.username, "color": p.color} for p in game.players
-        ]
-    }
+from shared import manager, serialize_game
 
 async def handle_bot_turns(game_id: str):
     import asyncio
@@ -357,6 +320,9 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(lifespan=lifespan)
+app.include_router(go_router, prefix="/go")
+app.include_router(chess_router, prefix="/chess")
+app.include_router(ttt_router, prefix="/tic-tac-toe")
 
 app.add_middleware(
     CORSMiddleware,
@@ -369,7 +335,7 @@ app.add_middleware(
 class CreateGameRequest(BaseModel):
     username: str
     color: str
-    game_type: str = "ludo"  # "ludo", "snake-ladder", "go", "chess", "tic-tac-toe", "bingo"
+    game_type: str = "ludo"
     board_size: int = 9      # For Go: 9, 13, 19
     difficulty: str = "medium" # For Chess/Tic-Tac-Toe/Bingo: easy, medium, hard
 
@@ -386,7 +352,7 @@ def create_game(req: CreateGameRequest, session: Session = Depends(get_session))
     color_upper = req.color.upper()
     game_type_lower = req.game_type.lower()
     
-    if game_type_lower not in ["ludo", "snake-ladder", "go", "chess", "tic-tac-toe", "bingo"]:
+    if game_type_lower not in ["ludo", "snake-ladder", "bingo"]:
         raise HTTPException(status_code=400, detail="Game type must be ludo, snake-ladder, go, chess, tic-tac-toe, or bingo")
         
     if game_type_lower in ["go", "chess"]:
@@ -419,9 +385,6 @@ def create_game(req: CreateGameRequest, session: Session = Depends(get_session))
         
     game = Game(game_type=game_type_lower, board_state=initial_board_state)
     session.add(game)
-    session.commit()
-    session.refresh(game)
-    
     player = Player(game_id=game.id, username=req.username, color=color_upper)
     session.add(player)
     session.commit()

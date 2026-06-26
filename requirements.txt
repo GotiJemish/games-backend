@@ -3,4 +3,5 @@ uvicorn
 sqlmodel
 python-dotenv
 psycopg2-binary
-python-chess
+python-chess
+gunicorn

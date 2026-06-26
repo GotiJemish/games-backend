@@ -393,7 +393,7 @@ def create_game(req: CreateGameRequest, session: Session = Depends(get_session))
     return serialize_game(game)
 
 @app.post("/games/{game_id}/join")
-def join_game(game_id: str, req: JoinGameRequest, session: Session = Depends(get_session)):
+async def join_game(game_id: str, req: JoinGameRequest, session: Session = Depends(get_session)):
     game = session.get(Game, game_id)
     if not game:
         raise HTTPException(status_code=404, detail="Game not found")
@@ -428,6 +428,16 @@ def join_game(game_id: str, req: JoinGameRequest, session: Session = Depends(get
     session.add(player)
     session.commit()
     session.refresh(game)
+    
+    import asyncio
+    asyncio.create_task(manager.broadcast(game_id, {
+        "type": "system",
+        "message": f"{req.username} ({color_upper}) has joined the lobby."
+    }))
+    asyncio.create_task(manager.broadcast(game_id, {
+        "type": "state",
+        "game": serialize_game(game)
+    }))
     
     return serialize_game(game)
 

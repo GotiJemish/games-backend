@@ -105,7 +105,7 @@ def create_lobby(req: CreateLobbyRequest, session: Session = Depends(get_session
     return serialize_game(game)
 
 @router.post("/{game_id}/joinLobby")
-def join_lobby(game_id: str, req: JoinLobbyRequest, session: Session = Depends(get_session)):
+async def join_lobby(game_id: str, req: JoinLobbyRequest, session: Session = Depends(get_session)):
     game = session.get(Game, game_id)
     if not game or game.game_type != "go":
         raise HTTPException(status_code=404, detail="Game not found")
@@ -129,6 +129,15 @@ def join_lobby(game_id: str, req: JoinLobbyRequest, session: Session = Depends(g
     session.add(player)
     session.commit()
     session.refresh(game)
+    
+    asyncio.create_task(manager.broadcast(game_id, {
+        "type": "system",
+        "message": f"{req.username} ({color_upper}) has joined the lobby."
+    }))
+    asyncio.create_task(manager.broadcast(game_id, {
+        "type": "state",
+        "game": serialize_game(game)
+    }))
     
     return serialize_game(game)
 

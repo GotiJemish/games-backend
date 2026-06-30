@@ -10,6 +10,7 @@ from models import Game, Player
 from go.api import router as go_router
 from chess_game.api import router as chess_router
 from tic_tac_toe.api import router as ttt_router
+from checkers.api import router as checkers_router
 from pydantic import BaseModel
 
 # Create a connection manager for WebSockets
@@ -310,6 +311,63 @@ async def handle_bot_turns(game_id: str):
                             "game": serialize_game(db_game)
                         })
             
+            elif db_game.game_type == "checkers":
+                from checkers.bot import get_bot_move as checkers_bot_move
+                from checkers.logic import make_move as checkers_make_move
+                from checkers.rules import get_next_turn_checkers, check_winner_checkers
+                
+                difficulty = db_game.board_state.get("difficulty", "medium")
+                bot_move = checkers_bot_move(db_game.board_state, current_player.color, difficulty)
+                
+                if bot_move is not None:
+                    from_pos, to_pos = bot_move
+                    new_board_state, success, move_desc = checkers_make_move(
+                        db_game.board_state, current_player.color, from_pos, to_pos
+                    )
+                    if success:
+                        db_game.board_state = new_board_state
+                        
+                        # Check for chain jumps
+                        if new_board_state.get("chain_from") is not None:
+                            db_game.has_rolled = False
+                            db_game.last_roll = None
+                            db.add(db_game)
+                            db.commit()
+                            db.refresh(db_game)
+                            await manager.broadcast(game_id, {
+                                "type": "move",
+                                "username": current_player.username,
+                                "color": current_player.color,
+                                "message": move_desc,
+                                "game": serialize_game(db_game)
+                            })
+                            asyncio.create_task(handle_bot_turns(game_id))
+                            return
+                        
+                        winner = check_winner_checkers(new_board_state)
+                        if winner:
+                            db_game.status = "finished"
+                            db_game.winner = winner
+                            db_game.current_turn = None
+                            move_desc += f" Game Over! Winner: {winner}"
+                        else:
+                            db_game.current_turn = get_next_turn_checkers(current_player.color)
+                            
+                        db_game.has_rolled = False
+                        db_game.last_roll = None
+                        
+                        db.add(db_game)
+                        db.commit()
+                        db.refresh(db_game)
+                        
+                        await manager.broadcast(game_id, {
+                            "type": "move",
+                            "username": current_player.username,
+                            "color": current_player.color,
+                            "message": move_desc,
+                            "game": serialize_game(db_game)
+                        })
+            
             # Chain play recursively if next player is also a bot
             asyncio.create_task(handle_bot_turns(game_id))
 
@@ -317,12 +375,37 @@ async def handle_bot_turns(game_id: str):
 async def lifespan(app: FastAPI):
     # Initialize database tables on startup
     init_db()
+    
+    # Seed default game configs
+    from models import GameConfig
+    default_configs = {
+        "ludo": {"is_public": True, "modes_enabled": ["local", "online", "ai"]},
+        "snake-ladder": {"is_public": True, "modes_enabled": ["local", "online", "ai"]},
+        "go": {"is_public": True, "modes_enabled": ["local", "online", "ai"]},
+        "chess": {"is_public": True, "modes_enabled": ["local", "online", "ai"]},
+        "tic-tac-toe": {"is_public": True, "modes_enabled": ["local", "online", "ai"]},
+        "bingo": {"is_public": True, "modes_enabled": ["local", "online", "ai"]},
+        "monopoly": {"is_public": True, "modes_enabled": ["local", "online"]},  # monopoly doesn't have AI
+        "checkers": {"is_public": True, "modes_enabled": ["local", "online", "ai"]}
+    }
+    with Session(engine) as session:
+        for game_id, defaults in default_configs.items():
+            db_config = session.get(GameConfig, game_id)
+            if not db_config:
+                new_config = GameConfig(
+                    id=game_id,
+                    is_public=defaults["is_public"],
+                    modes_enabled=defaults["modes_enabled"]
+                )
+                session.add(new_config)
+        session.commit()
     yield
 
 app = FastAPI(lifespan=lifespan)
 app.include_router(go_router, prefix="/go")
 app.include_router(chess_router, prefix="/chess")
 app.include_router(ttt_router, prefix="/tic-tac-toe")
+app.include_router(checkers_router, prefix="/checkers")
 
 app.add_middleware(
     CORSMiddleware,
@@ -331,6 +414,37 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+class GameConfigUpdate(BaseModel):
+    is_public: bool
+    modes_enabled: List[str]
+
+@app.get("/admin/configs")
+def get_admin_configs(session: Session = Depends(get_session)):
+    from models import GameConfig
+    configs = session.exec(select(GameConfig)).all()
+    return configs
+
+@app.get("/admin/configs/{game_id}")
+def get_admin_config(game_id: str, session: Session = Depends(get_session)):
+    from models import GameConfig
+    config = session.get(GameConfig, game_id)
+    if not config:
+        raise HTTPException(status_code=404, detail="Game config not found")
+    return config
+
+@app.put("/admin/configs/{game_id}")
+def update_admin_config(game_id: str, update_data: GameConfigUpdate, session: Session = Depends(get_session)):
+    from models import GameConfig
+    config = session.get(GameConfig, game_id)
+    if not config:
+        raise HTTPException(status_code=404, detail="Game config not found")
+    config.is_public = update_data.is_public
+    config.modes_enabled = update_data.modes_enabled
+    session.add(config)
+    session.commit()
+    session.refresh(config)
+    return config
 
 class CreateGameRequest(BaseModel):
     username: str
@@ -352,8 +466,8 @@ def create_game(req: CreateGameRequest, session: Session = Depends(get_session))
     color_upper = req.color.upper()
     game_type_lower = req.game_type.lower()
     
-    if game_type_lower not in ["ludo", "snake-ladder", "bingo"]:
-        raise HTTPException(status_code=400, detail="Game type must be ludo, snake-ladder, go, chess, tic-tac-toe, or bingo")
+    if game_type_lower not in ["ludo", "snake-ladder", "bingo", "monopoly", "checkers"]:
+        raise HTTPException(status_code=400, detail="Game type must be ludo, snake-ladder, bingo, monopoly, or checkers")
         
     if game_type_lower in ["go", "chess"]:
         if color_upper not in ["BLACK", "WHITE"]:
@@ -364,6 +478,9 @@ def create_game(req: CreateGameRequest, session: Session = Depends(get_session))
     elif game_type_lower == "bingo":
         if color_upper not in ["BLUE", "RED"]:
             raise HTTPException(status_code=400, detail="Color for Bingo must be BLUE or RED")
+    elif game_type_lower == "checkers":
+        if color_upper not in ["RED", "BLACK"]:
+            raise HTTPException(status_code=400, detail="Color for Checkers must be RED or BLACK")
     else:
         if color_upper not in ["RED", "GREEN", "YELLOW", "BLUE"]:
             raise HTTPException(status_code=400, detail="Color must be RED, GREEN, YELLOW, or BLUE")
@@ -380,6 +497,9 @@ def create_game(req: CreateGameRequest, session: Session = Depends(get_session))
     elif game_type_lower == "bingo":
         from bingo.logic import initialize_board as bingo_init
         initial_board_state = bingo_init(req.difficulty)
+    elif game_type_lower == "checkers":
+        from checkers.logic import initialize_board as checkers_init
+        initial_board_state = checkers_init(req.difficulty)
     else:
         initial_board_state = {}
         
@@ -400,7 +520,7 @@ async def join_game(game_id: str, req: JoinGameRequest, session: Session = Depen
     if game.status != "waiting":
         raise HTTPException(status_code=400, detail="Cannot join a game that has already started or finished")
         
-    max_players = 2 if game.game_type in ["go", "chess", "tic-tac-toe", "bingo"] else 4
+    max_players = 2 if game.game_type in ["go", "chess", "tic-tac-toe", "bingo", "checkers"] else 4
     if len(game.players) >= max_players:
         raise HTTPException(status_code=400, detail=f"Game is full (max {max_players} players)")
         
@@ -414,6 +534,9 @@ async def join_game(game_id: str, req: JoinGameRequest, session: Session = Depen
     elif game.game_type == "bingo":
         if color_upper not in ["BLUE", "RED"]:
             raise HTTPException(status_code=400, detail="Color for Bingo must be BLUE or RED")
+    elif game.game_type == "checkers":
+        if color_upper not in ["RED", "BLACK"]:
+            raise HTTPException(status_code=400, detail="Color for Checkers must be RED or BLACK")
     else:
         if color_upper not in ["RED", "GREEN", "YELLOW", "BLUE"]:
             raise HTTPException(status_code=400, detail="Color must be RED, GREEN, YELLOW, or BLUE")
@@ -449,7 +572,7 @@ async def add_bot(game_id: str, req: JoinGameRequest, session: Session = Depends
     if game.status != "waiting":
         raise HTTPException(status_code=400, detail="Cannot add bot to a game that has already started or finished")
         
-    max_players = 2 if game.game_type in ["go", "chess", "tic-tac-toe", "bingo"] else 4
+    max_players = 2 if game.game_type in ["go", "chess", "tic-tac-toe", "bingo", "checkers"] else 4
     if len(game.players) >= max_players:
         raise HTTPException(status_code=400, detail=f"Game is full (max {max_players} players)")
         
@@ -463,6 +586,9 @@ async def add_bot(game_id: str, req: JoinGameRequest, session: Session = Depends
     elif game.game_type == "bingo":
         if color_upper not in ["BLUE", "RED"]:
             raise HTTPException(status_code=400, detail="Color for Bingo must be BLUE or RED")
+    elif game.game_type == "checkers":
+        if color_upper not in ["RED", "BLACK"]:
+            raise HTTPException(status_code=400, detail="Color for Checkers must be RED or BLACK")
     else:
         if color_upper not in ["RED", "GREEN", "YELLOW", "BLUE"]:
             raise HTTPException(status_code=400, detail="Color must be RED, GREEN, YELLOW, or BLUE")
@@ -529,6 +655,18 @@ async def start_game(game_id: str, session: Session = Depends(get_session)):
             game.current_turn = "BLUE"
         else:
             game.current_turn = active_colors[0]
+    elif game.game_type == "monopoly":
+        from monopoly.logic import initialize_board as monopoly_init
+        game.board_state = monopoly_init(active_colors)
+        if "RED" in active_colors:
+            game.current_turn = "RED"
+        else:
+            game.current_turn = active_colors[0]
+    elif game.game_type == "checkers":
+        from checkers.logic import initialize_board as checkers_init
+        difficulty = game.board_state.get("difficulty", "medium")
+        game.board_state = checkers_init(difficulty=difficulty)
+        game.current_turn = "RED"  # Red always plays first in checkers
     else:
         from ludo.logic import initialize_board
         game.board_state = initialize_board(active_colors)
@@ -980,6 +1118,273 @@ async def websocket_endpoint(websocket: WebSocket, game_id: str, username: str):
                     })
                     import asyncio
                     asyncio.create_task(handle_bot_turns(game_id))
+                elif action == "move_piece":
+                    if db_game.game_type != "checkers":
+                        await websocket.send_json({"type": "error", "message": "Action not allowed for this game type."})
+                        continue
+                    if db_game.current_turn != db_player.color:
+                        await websocket.send_json({"type": "error", "message": "It is not your turn."})
+                        continue
+                        
+                    from_pos = data.get("from_pos")
+                    to_pos = data.get("to_pos")
+                    if from_pos is None or to_pos is None:
+                        await websocket.send_json({"type": "error", "message": "from_pos and to_pos are required."})
+                        continue
+                        
+                    from checkers.logic import make_move as checkers_make_move
+                    from checkers.rules import get_next_turn_checkers, check_winner_checkers
+                    
+                    new_board_state, success, move_desc = checkers_make_move(
+                        db_game.board_state, db_player.color, from_pos, to_pos
+                    )
+                    if not success:
+                        await websocket.send_json({"type": "error", "message": move_desc})
+                        continue
+                        
+                    db_game.board_state = new_board_state
+                    
+                    # Check for chain jumps
+                    if new_board_state.get("chain_from") is not None:
+                        db_game.has_rolled = False
+                        db_game.last_roll = None
+                        db.add(db_game)
+                        db.commit()
+                        db.refresh(db_game)
+                        await manager.broadcast(game_id, {
+                            "type": "move",
+                            "username": db_player.username,
+                            "color": db_player.color,
+                            "message": move_desc,
+                            "game": serialize_game(db_game)
+                        })
+                        continue
+                    
+                    winner = check_winner_checkers(new_board_state)
+                    if winner:
+                        db_game.status = "finished"
+                        db_game.winner = winner
+                        db_game.current_turn = None
+                        if winner == "DRAW":
+                            move_desc += " Game Over! It's a DRAW!"
+                        else:
+                            move_desc += f" Game Over! Winner: {winner}"
+                    else:
+                        db_game.current_turn = get_next_turn_checkers(db_player.color)
+                        
+                    db_game.has_rolled = False
+                    db_game.last_roll = None
+                    
+                    db.add(db_game)
+                    db.commit()
+                    db.refresh(db_game)
+                    
+                    await manager.broadcast(game_id, {
+                        "type": "move",
+                        "username": db_player.username,
+                        "color": db_player.color,
+                        "message": move_desc,
+                        "game": serialize_game(db_game)
+                    })
+                    import asyncio
+                    asyncio.create_task(handle_bot_turns(game_id))
+                elif action == "roll_dice_monopoly":
+                    if db_game.current_turn != db_player.color:
+                        await websocket.send_json({"type": "error", "message": "It is not your turn."})
+                        continue
+                    if db_game.board_state.get("phase") != "roll":
+                        await websocket.send_json({"type": "error", "message": "You have already rolled this turn."})
+                        continue
+                    roll1 = random.randint(1, 6)
+                    roll2 = random.randint(1, 6)
+                    from monopoly.logic import make_move as mono_make_move
+                    new_board_state, msg = mono_make_move(db_game.board_state, db_player.color, roll1, roll2)
+                    db_game.board_state = new_board_state
+                    db_game.last_roll = roll1 + roll2
+                    if new_board_state.get("phase") == "finished":
+                        db_game.status = "finished"
+                        active_players = [col for col, p in new_board_state["players"].items() if not p["bankrupt"]]
+                        if active_players:
+                            db_game.winner = active_players[0]
+                        db_game.current_turn = None
+                    db.add(db_game)
+                    db.commit()
+                    db.refresh(db_game)
+                    await manager.broadcast(game_id, {
+                        "type": "move",
+                        "username": db_player.username,
+                        "color": db_player.color,
+                        "message": msg,
+                        "game": serialize_game(db_game)
+                    })
+                elif action == "buy_property_monopoly":
+                    if db_game.current_turn != db_player.color:
+                        await websocket.send_json({"type": "error", "message": "It is not your turn."})
+                        continue
+                    property_idx = data.get("property_idx")
+                    if property_idx is None:
+                        await websocket.send_json({"type": "error", "message": "Property index is required."})
+                        continue
+                    from monopoly.logic import buy_property as mono_buy
+                    new_board_state, success, msg = mono_buy(db_game.board_state, db_player.color, property_idx)
+                    if not success:
+                        await websocket.send_json({"type": "error", "message": msg})
+                        continue
+                    db_game.board_state = new_board_state
+                    db.add(db_game)
+                    db.commit()
+                    db.refresh(db_game)
+                    await manager.broadcast(game_id, {
+                        "type": "move",
+                        "username": db_player.username,
+                        "color": db_player.color,
+                        "message": msg,
+                        "game": serialize_game(db_game)
+                    })
+                elif action == "build_house_monopoly":
+                    if db_game.current_turn != db_player.color:
+                        await websocket.send_json({"type": "error", "message": "It is not your turn."})
+                        continue
+                    property_idx = data.get("property_idx")
+                    if property_idx is None:
+                        await websocket.send_json({"type": "error", "message": "Property index is required."})
+                        continue
+                    from monopoly.logic import build_house as mono_build_house
+                    new_board_state, success, msg = mono_build_house(db_game.board_state, db_player.color, property_idx)
+                    if not success:
+                        await websocket.send_json({"type": "error", "message": msg})
+                        continue
+                    db_game.board_state = new_board_state
+                    db.add(db_game)
+                    db.commit()
+                    db.refresh(db_game)
+                    await manager.broadcast(game_id, {
+                        "type": "move",
+                        "username": db_player.username,
+                        "color": db_player.color,
+                        "message": msg,
+                        "game": serialize_game(db_game)
+                    })
+                elif action == "sell_house_monopoly":
+                    if db_game.current_turn != db_player.color:
+                        await websocket.send_json({"type": "error", "message": "It is not your turn."})
+                        continue
+                    property_idx = data.get("property_idx")
+                    if property_idx is None:
+                        await websocket.send_json({"type": "error", "message": "Property index is required."})
+                        continue
+                    from monopoly.logic import sell_house as mono_sell_house
+                    new_board_state, success, msg = mono_sell_house(db_game.board_state, db_player.color, property_idx)
+                    if not success:
+                        await websocket.send_json({"type": "error", "message": msg})
+                        continue
+                    db_game.board_state = new_board_state
+                    db.add(db_game)
+                    db.commit()
+                    db.refresh(db_game)
+                    await manager.broadcast(game_id, {
+                        "type": "move",
+                        "username": db_player.username,
+                        "color": db_player.color,
+                        "message": msg,
+                        "game": serialize_game(db_game)
+                    })
+                elif action == "mortgage_property_monopoly":
+                    if db_game.current_turn != db_player.color:
+                        await websocket.send_json({"type": "error", "message": "It is not your turn."})
+                        continue
+                    property_idx = data.get("property_idx")
+                    if property_idx is None:
+                        await websocket.send_json({"type": "error", "message": "Property index is required."})
+                        continue
+                    from monopoly.logic import mortgage_property as mono_mortgage
+                    new_board_state, success, msg = mono_mortgage(db_game.board_state, db_player.color, property_idx)
+                    if not success:
+                        await websocket.send_json({"type": "error", "message": msg})
+                        continue
+                    db_game.board_state = new_board_state
+                    db.add(db_game)
+                    db.commit()
+                    db.refresh(db_game)
+                    await manager.broadcast(game_id, {
+                        "type": "move",
+                        "username": db_player.username,
+                        "color": db_player.color,
+                        "message": msg,
+                        "game": serialize_game(db_game)
+                    })
+                elif action == "pay_jail_fine_monopoly":
+                    if db_game.current_turn != db_player.color:
+                        await websocket.send_json({"type": "error", "message": "It is not your turn."})
+                        continue
+                    from monopoly.logic import pay_jail_fine as mono_pay_jail
+                    new_board_state, success, msg = mono_pay_jail(db_game.board_state, db_player.color)
+                    if not success:
+                        await websocket.send_json({"type": "error", "message": msg})
+                        continue
+                    db_game.board_state = new_board_state
+                    db.add(db_game)
+                    db.commit()
+                    db.refresh(db_game)
+                    await manager.broadcast(game_id, {
+                        "type": "move",
+                        "username": db_player.username,
+                        "color": db_player.color,
+                        "message": msg,
+                        "game": serialize_game(db_game)
+                    })
+                elif action == "declare_bankruptcy_monopoly":
+                    if db_game.current_turn != db_player.color:
+                        await websocket.send_json({"type": "error", "message": "It is not your turn."})
+                        continue
+                    from monopoly.logic import declare_bankruptcy as mono_bankrupt
+                    new_board_state, success, msg = mono_bankrupt(db_game.board_state, db_player.color)
+                    if not success:
+                        await websocket.send_json({"type": "error", "message": msg})
+                        continue
+                    db_game.board_state = new_board_state
+                    if new_board_state.get("phase") == "finished":
+                        db_game.status = "finished"
+                        active_players = [col for col, p in new_board_state["players"].items() if not p["bankrupt"]]
+                        if active_players:
+                            db_game.winner = active_players[0]
+                        db_game.current_turn = None
+                    else:
+                        from monopoly.logic import end_turn as mono_end_turn
+                        active_colors = [p.color for p in db_game.players]
+                        new_board_state, pass_msg = mono_end_turn(db_game.board_state, active_colors)
+                        db_game.board_state = new_board_state
+                    db.add(db_game)
+                    db.commit()
+                    db.refresh(db_game)
+                    await manager.broadcast(game_id, {
+                        "type": "move",
+                        "username": db_player.username,
+                        "color": db_player.color,
+                        "message": msg,
+                        "game": serialize_game(db_game)
+                    })
+                elif action == "end_turn_monopoly":
+                    if db_game.current_turn != db_player.color:
+                        await websocket.send_json({"type": "error", "message": "It is not your turn."})
+                        continue
+                    if db_game.board_state.get("phase") == "roll":
+                        await websocket.send_json({"type": "error", "message": "You must roll the dice first."})
+                        continue
+                    from monopoly.logic import end_turn as mono_end_turn
+                    active_colors = [p.color for p in db_game.players]
+                    new_board_state, msg = mono_end_turn(db_game.board_state, active_colors)
+                    db_game.board_state = new_board_state
+                    db.add(db_game)
+                    db.commit()
+                    db.refresh(db_game)
+                    await manager.broadcast(game_id, {
+                        "type": "move",
+                        "username": db_player.username,
+                        "color": db_player.color,
+                        "message": msg,
+                        "game": serialize_game(db_game)
+                    })
                 elif action == "chat":
                     msg = data.get("message", "")
                     if msg:

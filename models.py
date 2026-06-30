@@ -22,3 +22,8 @@ class Player(SQLModel, table=True):
     color: str  # RED, GREEN, YELLOW, BLUE
     
     game: Optional[Game] = Relationship(back_populates="players")
+
+class GameConfig(SQLModel, table=True):
+    id: str = Field(primary_key=True)  # ludo, monopoly, snake-ladder, etc.
+    is_public: bool = Field(default=True)
+    modes_enabled: List[str] = Field(default_factory=list, sa_column=Column(JSON))

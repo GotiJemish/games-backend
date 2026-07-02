@@ -1,6 +1,8 @@
+import os
 import random
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Header
+from typing import Optional
 from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import Session, select
 from typing import Dict, List
@@ -163,13 +165,14 @@ async def handle_bot_turns(game_id: str):
                     })
                 else:
                     board_copy = {k: list(v) for k, v in db_game.board_state.items()}
-                    new_board_state, captured, move_desc = ludo_make_move(board_copy, current_player.color, token_idx, roll)
+                    active_colors = [p.color for p in db_game.players]
+                    new_board_state, captured, move_desc = ludo_make_move(board_copy, current_player.color, token_idx, roll, active_colors)
                     
                     db_game.board_state = new_board_state
                     db_game.last_roll = roll
                     db_game.has_rolled = False
                     
-                    winner = ludo_check_winner(new_board_state)
+                    winner = ludo_check_winner(new_board_state, active_colors)
                     if winner:
                         db_game.status = "finished"
                         db_game.winner = winner
@@ -433,8 +436,34 @@ def get_admin_config(game_id: str, session: Session = Depends(get_session)):
         raise HTTPException(status_code=404, detail="Game config not found")
     return config
 
+ADMIN_PASSCODE = os.getenv("ADMIN_PASSCODE", "admin123")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "super_secret_admin_token")
+
+def get_current_admin(authorization: Optional[str] = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    token = authorization.split(" ")[1]
+    if token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    return True
+
+class AdminLoginRequest(BaseModel):
+    passcode: str
+
+@app.post("/admin/login")
+def admin_login(req: AdminLoginRequest):
+    if req.passcode != ADMIN_PASSCODE:
+        raise HTTPException(status_code=401, detail="Incorrect admin passcode")
+    return {"status": "success", "token": ADMIN_TOKEN}
+
+@app.post("/admin/logout")
+def admin_logout(is_admin: bool = Depends(get_current_admin)):
+    # In a stateless setup, the client dropping the token is sufficient, 
+    # but having this endpoint is a good practice.
+    return {"status": "success"}
+
 @app.put("/admin/configs/{game_id}")
-def update_admin_config(game_id: str, update_data: GameConfigUpdate, session: Session = Depends(get_session)):
+def update_admin_config(game_id: str, update_data: GameConfigUpdate, session: Session = Depends(get_session), is_admin: bool = Depends(get_current_admin)):
     from models import GameConfig
     config = session.get(GameConfig, game_id)
     if not config:
@@ -452,6 +481,8 @@ class CreateGameRequest(BaseModel):
     game_type: str = "ludo"
     board_size: int = 9      # For Go: 9, 13, 19
     difficulty: str = "medium" # For Chess/Tic-Tac-Toe/Bingo: easy, medium, hard
+    num_players: int = 4     # For custom Ludo
+    num_pawns: int = 4       # For custom Ludo (4 to 10)
 
 class JoinGameRequest(BaseModel):
     username: str
@@ -482,8 +513,8 @@ def create_game(req: CreateGameRequest, session: Session = Depends(get_session))
         if color_upper not in ["RED", "BLACK"]:
             raise HTTPException(status_code=400, detail="Color for Checkers must be RED or BLACK")
     else:
-        if color_upper not in ["RED", "GREEN", "YELLOW", "BLUE"]:
-            raise HTTPException(status_code=400, detail="Color must be RED, GREEN, YELLOW, or BLUE")
+        if color_upper not in ["RED", "GREEN", "YELLOW", "BLUE"] and not color_upper.startswith("COLOR_"):
+            raise HTTPException(status_code=400, detail="Invalid color for Ludo")
         
     # Store initial board_size inside board_state or initialize chess/tic-tac-toe/bingo board
     if game_type_lower == "go":
@@ -500,6 +531,8 @@ def create_game(req: CreateGameRequest, session: Session = Depends(get_session))
     elif game_type_lower == "checkers":
         from checkers.logic import initialize_board as checkers_init
         initial_board_state = checkers_init(req.difficulty)
+    elif game_type_lower == "ludo":
+        initial_board_state = {"num_players": req.num_players, "num_pawns": req.num_pawns}
     else:
         initial_board_state = {}
         
@@ -521,6 +554,8 @@ async def join_game(game_id: str, req: JoinGameRequest, session: Session = Depen
         raise HTTPException(status_code=400, detail="Cannot join a game that has already started or finished")
         
     max_players = 2 if game.game_type in ["go", "chess", "tic-tac-toe", "bingo", "checkers"] else 4
+    if game.game_type == "ludo":
+        max_players = game.board_state.get("num_players", 4)
     if len(game.players) >= max_players:
         raise HTTPException(status_code=400, detail=f"Game is full (max {max_players} players)")
         
@@ -538,8 +573,8 @@ async def join_game(game_id: str, req: JoinGameRequest, session: Session = Depen
         if color_upper not in ["RED", "BLACK"]:
             raise HTTPException(status_code=400, detail="Color for Checkers must be RED or BLACK")
     else:
-        if color_upper not in ["RED", "GREEN", "YELLOW", "BLUE"]:
-            raise HTTPException(status_code=400, detail="Color must be RED, GREEN, YELLOW, or BLUE")
+        if color_upper not in ["RED", "GREEN", "YELLOW", "BLUE"] and not color_upper.startswith("COLOR_"):
+            raise HTTPException(status_code=400, detail="Invalid color for Ludo")
         
     for p in game.players:
         if p.color == color_upper:
@@ -573,6 +608,8 @@ async def add_bot(game_id: str, req: JoinGameRequest, session: Session = Depends
         raise HTTPException(status_code=400, detail="Cannot add bot to a game that has already started or finished")
         
     max_players = 2 if game.game_type in ["go", "chess", "tic-tac-toe", "bingo", "checkers"] else 4
+    if game.game_type == "ludo":
+        max_players = game.board_state.get("num_players", 4)
     if len(game.players) >= max_players:
         raise HTTPException(status_code=400, detail=f"Game is full (max {max_players} players)")
         
@@ -590,8 +627,8 @@ async def add_bot(game_id: str, req: JoinGameRequest, session: Session = Depends
         if color_upper not in ["RED", "BLACK"]:
             raise HTTPException(status_code=400, detail="Color for Checkers must be RED or BLACK")
     else:
-        if color_upper not in ["RED", "GREEN", "YELLOW", "BLUE"]:
-            raise HTTPException(status_code=400, detail="Color must be RED, GREEN, YELLOW, or BLUE")
+        if color_upper not in ["RED", "GREEN", "YELLOW", "BLUE"] and not color_upper.startswith("COLOR_"):
+            raise HTTPException(status_code=400, detail="Invalid color for Ludo")
         
     for p in game.players:
         if p.color == color_upper:
@@ -669,7 +706,13 @@ async def start_game(game_id: str, session: Session = Depends(get_session)):
         game.current_turn = "RED"  # Red always plays first in checkers
     else:
         from ludo.logic import initialize_board
-        game.board_state = initialize_board(active_colors)
+        # Preserve custom ludo config if present
+        num_pawns = game.board_state.get("num_pawns", 4)
+        num_players_intended = game.board_state.get("num_players", 4)
+        game.board_state = initialize_board(active_colors, num_pawns=num_pawns)
+        game.board_state["num_pawns"] = num_pawns
+        game.board_state["num_players"] = num_players_intended
+        
         if "RED" in active_colors:
             game.current_turn = "RED"
         else:
@@ -807,7 +850,8 @@ async def websocket_endpoint(websocket: WebSocket, game_id: str, username: str):
                         msg = f"{db_player.username} ({db_player.color}) rolled a {roll}."
                         
                         from ludo.rules import has_valid_moves, get_next_turn
-                        if not has_valid_moves(db_player.color, tokens, roll):
+                        active_colors = [p.color for p in db_game.players]
+                        if not has_valid_moves(db_player.color, tokens, roll, active_colors):
                             db_game.has_rolled = False
                             active_colors = [p.color for p in db_game.players]
                             next_color = get_next_turn(db_player.color, active_colors)
@@ -838,16 +882,18 @@ async def websocket_endpoint(websocket: WebSocket, game_id: str, username: str):
                         continue
                         
                     token_idx = data.get("token_idx")
-                    if token_idx is None or not (0 <= token_idx <= 3):
-                        await websocket.send_json({"type": "error", "message": "Invalid token index (must be 0 to 3)."})
+                    num_pawns = db_game.board_state.get("num_pawns", 4)
+                    if token_idx is None or not (0 <= token_idx < num_pawns):
+                        await websocket.send_json({"type": "error", "message": f"Invalid token index (must be 0 to {num_pawns - 1})."})
                         continue
                         
                     from ludo.logic import make_move, check_winner
                     from ludo.rules import get_next_turn
                     
                     board_copy = {k: list(v) for k, v in db_game.board_state.items()}
+                    active_colors = [p.color for p in db_game.players]
                     new_board_state, captured, move_desc = make_move(
-                        board_copy, db_player.color, token_idx, db_game.last_roll
+                        board_copy, db_player.color, token_idx, db_game.last_roll, active_colors
                     )
                     
                     if new_board_state[db_player.color][token_idx] == db_game.board_state[db_player.color][token_idx]:
@@ -856,7 +902,7 @@ async def websocket_endpoint(websocket: WebSocket, game_id: str, username: str):
                         
                     db_game.board_state = new_board_state
                     
-                    winner = check_winner(new_board_state)
+                    winner = check_winner(new_board_state, active_colors)
                     if winner:
                         db_game.status = "finished"
                         db_game.winner = winner
